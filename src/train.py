@@ -1,89 +1,75 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+import argparse, torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from src.models.gru import OutageGRU
-from src.data.window import SlidingWindowDataset
-from src.evaluate import pr_auc, roc_auc, f1_at
-
-class WeightedBCELoss(nn.Module):
-    """
-    Weighted BCELoss is a custom losss function used for model training
-    ///
-    In this class the problems that are addressed aare imbalanced dataset where the positive class is rare and compared to the negative class
-    this class helps is to be dominated by the negatuve class that leading  the model to predict 0 most of the times
-    """
-    def __init__(self, pos_weight: float = 1.0):
-        super().__init__()
-        self.bce = nn.BCELoss(reduction='none')
-        self.pos_weight = pos_weight
-
-    def forward(self, preds, targets):
-        w = torch.ones_like(targets)
-        w[targets==1] = self.pos_weight
-        return (self.bce(preds, targets)*w).mean()
 
 
-class TempScaler(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.t = nn.Parameter(torch.ones(1))
+def load_split(path):
+    pkg = torch.load(path, map_location="cpu")
+    ds = TensorDataset(pkg["X_metrics"], pkg["X_events"], pkg["y"])
+    return ds, pkg
 
-    def forward(self, p):
-        # p in (0,1), map to logit, scale, back to prob
-        eps = 1e-6
-        logit = torch.log(p.clamp(eps,1-eps)) - torch.log(1-p.clamp(eps,1-eps))
-        logit = logit / self.t
-        return torch.sigmoid(logit)
+def train_one_epoch(model, loader, opt, device, pos_weight=10.0):
+    bce = torch.nn.BCELoss(reduction="none")
+    model.train()
+    for xm, xe, y in loader:
+        xm, xe, y = xm.to(device), xe.to(device), y.to(device)
+        p = model(xm, xe)
+        w = torch.ones_like(y); w[y==1] = pos_weight
+        loss = (bce(p, y) * w).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
 
+def evaluate(model, loader, device):
+    import numpy as np
+    from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
+    model.eval()
+    P, Y = [], []
+    with torch.no_grad():
+        for xm, xe, y in loader:
+            p = model(xm.to(device), xe.to(device)).cpu().numpy()
+            P.append(p); Y.append(y.numpy())
+    P = np.concatenate(P); Y = np.concatenate(Y)
+    pr = float(average_precision_score(Y, P))
+    roc = float(roc_auc_score(Y, P))
+    f1 = float(f1_score(Y, (P>=0.5).astype(int)))
+    return pr, roc, f1
 
-def train_model(train_ds, val_ds, fm, fe, pos_weight=10.0, epochs=10, lr=1e-3, bs=256, device='cuda'):
-    model = OutageGRU(fm, fe).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    crit = WeightedBCELoss(pos_weight)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)  # folder containing train.pt/val.pt/test.pt
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--pos-weight", type=float, default=10.0)
+    args = ap.parse_args()
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=4)
+    train_ds, meta = load_split(f"{args.data}/train.pt")
+    val_ds, _      = load_split(f"{args.data}/val.pt")
 
+    fm = train_ds.tensors[0].shape[-1]
+    fe = train_ds.tensors[1].shape[-1]
 
-    best_auc, best_state = 0.0, None
-    for ep in range(1, epochs+1):
-        model.train()
-        for xm, xe, y in train_loader:
-            xm, xe, y = xm.to(device), xe.to(device), y.to(device)
-            p = model(xm, xe)
-            loss = crit(p, y)
-            opt.zero_grad(); loss.backward(); opt.step()
-# validation
-        model.eval()
-        preds, targs = [], []
-        with torch.no_grad():
-            for xm, xe, y in val_loader:
-                xm, xe = xm.to(device), xe.to(device)
-                p = model(xm, xe)
-                preds.append(p.cpu()); targs.append(y)
-        import torch
-        preds = torch.cat(preds).numpy(); targs = torch.cat(targs).numpy()
-        auc = pr_auc(targs, preds)
-        print(f"[ep {ep}] PR-AUC={auc:.4f}")
-        if auc > best_auc:
-            best_auc, best_state = auc, model.state_dict()
-    if best_state is not None:
-        model.load_state_dict(best_state)
-# temperature scaling on val set
-    scaler = TempScaler().to(device)
-    opt_t = torch.optim.LBFGS(scaler.parameters(), lr=0.1, max_iter=50)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False)
+    model = OutageGRU(fm=fm, fe=fe).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False)
 
-    def _closure():
-        opt_t.zero_grad();
-        loss = 0.0
-        for xm, xe, y in val_loader:
-            with torch.no_grad():
-                p = model(xm.to(device), xe.to(device))
-            p_cal = scaler(p)
-            loss += nn.BCELoss()(p_cal, y.to(device))
-        loss.backward(); return loss
-    opt_t.step(_closure)
-    return model, scaler
+    best_pr = -1.0
+    for ep in range(1, args.epochs+1):
+        train_one_epoch(model, train_loader, opt, device, pos_weight=args.pos_weight)
+        pr, roc, f1 = evaluate(model, val_loader, device)
+        print(f"[epoch {ep}] PR-AUC={pr:.4f} ROC-AUC={roc:.4f} F1={f1:.4f}")
+        if pr > best_pr:
+            best_pr = pr
+            torch.save({"state_dict": model.state_dict(), "fm": fm, "fe": fe}, f"{args.data}/best_gru.pt")
+
+if __name__ == "__main__":
+    main()
