@@ -17,6 +17,17 @@ def load_split(path):
     ds = TensorDataset(pkg["X_metrics"], pkg["X_events"], pkg["y"])
     return ds, pkg
 
+import numpy as np
+from sklearn.metrics import f1_score
+
+def best_threshold(y_true, y_prob):
+    thr_grid = np.linspace(0.01, 0.99, 99)
+    scores = [(t, f1_score(y_true, (y_prob >= t).astype(int))) for t in thr_grid]
+    return max(scores, key=lambda x: x[1])  # (thr, f1)
+
+# inside evaluate(): also return the raw probs & labels if called on val
+
+
 
 def train_one_epoch(model, loader, opt, device, pos_weight=10.0):
     bce = torch.nn.BCELoss(reduction="none")
