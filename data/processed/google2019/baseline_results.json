@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "features": [
+      "cpu",
+      "mem",
+      "disk",
+      "net",
+      "throttle",
+      "tasks_running"
+    ],
+    "event_features": [
+      "fail_burst"
+    ],
+    "T": 30
+  },
+  "results": [
+    {
+      "model": "LogisticRegression",
+      "pr_auc": 0.011843011476777875,
+      "roc_auc": 0.02278106508875739,
+      "f1": 0.0
+    },
+    {
+      "model": "RandomForest",
+      "pr_auc": 0.01913118344040775,
+      "roc_auc": 0.3995069033530573,
+      "f1": 0.0
+    }
+  ]
+}
